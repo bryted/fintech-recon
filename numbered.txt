@@ -1,0 +1,542 @@
+1:# ======================================================================
+2:# MojoPay Reconciliation Engine (Final Production Version)
+3:# ======================================================================
+4:
+5:import pandas as pd
+6:import numpy as np
+7:import re
+8:import warnings
+9:from rapidfuzz import fuzz
+10:
+11:# ======================================================================
+12:# CANONICAL FIELDS
+13:# ======================================================================
+14:
+15:REQUIRED_COLUMNS = {
+16:    "reference": "MojoPay Reference No",
+17:    "date": "Transaction Date",
+18:    "amount": "Transacted Amount",
+19:    "status": "Status",
+20:    "merchant": "Merchant Ref Code",
+21:    "mobile": "Payer Mobile",
+22:}
+23:
+24:FUZZY_THRESHOLD = 80   # strict fuzzy tolerance
+25:
+26:
+27:# ======================================================================
+28:# UTILITIES — NORMALIZATION
+29:# ======================================================================
+30:
+31:def normalize_string(s: str) -> str:
+32:    if not isinstance(s, str):
+33:        return ""
+34:    s = s.lower()
+35:    return re.sub(r"[^a-z0-9]+", "", s).strip()
+36:
+37:
+38:def find_column_case_insensitive(df: pd.DataFrame, target: str):
+39:    target_norm = target.strip().lower()
+40:    for col in df.columns:
+41:        if col.strip().lower() == target_norm:
+42:            return col
+43:    return None
+44:
+45:
+46:def standardize_reference_series(series: pd.Series) -> pd.Series:
+47:    def normalize(val):
+48:        if pd.isna(val):
+49:            return np.nan
+50:        if isinstance(val, (int, np.integer)):
+51:            return str(val)
+52:        if isinstance(val, (float, np.floating)):
+53:            if float(val).is_integer():
+54:                return str(int(val))
+55:            return str(val).strip()
+56:        text = str(val).strip()
+57:        if not text or text.lower() in {"nan", "none"}:
+58:            return np.nan
+59:        return text
+60:
+61:    normalized = series.apply(normalize)
+62:    return normalized
+63:
+64:
+65:# ======================================================================
+66:# 1. DETERMINISTIC COLUMN DETECTION
+67:# ======================================================================
+68:
+69:COLUMN_RULES = {
+70:    "reference": ["mojopay", "reference", "ref_no", "rrn", "transid", "transactionid"],
+71:    "date": ["date", "transdate", "transactiondate", "datetime"],
+72:    "amount": ["amount", "amt", "transactedamount", "transactionamount"],
+73:    "status": ["status", "state", "transstatus", "responsecode"],
+74:    "merchant": ["merchant", "merchantref", "merchantreference", "refcode", "trans.id"],
+75:    "mobile": ["mobile", "msisdn", "payer", "payermobile", "phonenumber"],
+76:}
+77:
+78:def detect_column_by_rules(col_name: str):
+79:    col_norm = normalize_string(col_name)
+80:    for key, patterns in COLUMN_RULES.items():
+81:        for pat in patterns:
+82:            if pat in col_norm:
+83:                return key
+84:    return None
+85:
+86:
+87:# ======================================================================
+88:# 2. SECONDARY FUZZY MATCHING
+89:# ======================================================================
+90:
+91:def best_fuzzy_match(col_name: str, candidates: dict):
+92:    norm_col = normalize_string(col_name)
+93:    best_score = 0
+94:    best_key = None
+95:
+96:    for key, canonical in candidates.items():
+97:        score = fuzz.ratio(norm_col, normalize_string(canonical))
+98:        if score > best_score:
+99:            best_score = score
+100:            best_key = key
+101:
+102:    if best_score >= FUZZY_THRESHOLD:
+103:        return best_key
+104:    return None
+105:
+106:
+107:# ======================================================================
+108:# 3. MASTER COLUMN DETECTOR
+109:# ======================================================================
+110:
+111:def detect_all_columns(df: pd.DataFrame, sheet_name: str):
+112:    diagnostics = {
+113:        "sheet": sheet_name,
+114:        "columns_detected": df.columns.tolist(),
+115:        "mapping": {},
+116:        "missing_after_detection": [],
+117:    }
+118:
+119:    mapping = {}
+120:
+121:    # Pass 1: deterministic
+122:    for col in df.columns:
+123:        rule_match = detect_column_by_rules(col)
+124:        if rule_match:
+125:            mapping.setdefault(rule_match, []).append(col)
+126:
+127:    # Pass 2: fuzzy fallback for unmatched canonical fields
+128:    for key in REQUIRED_COLUMNS.keys():
+129:        if key not in mapping:
+130:            for col in df.columns:
+131:                if detect_column_by_rules(col):
+132:                    continue
+133:                fuzzy_key = best_fuzzy_match(col, REQUIRED_COLUMNS)
+134:                if fuzzy_key == key:
+135:                    mapping.setdefault(key, []).append(col)
+136:
+137:    # Resolve collisions — pick best column in each group
+138:    resolved = {}
+139:    for key, cols in mapping.items():
+140:        if len(cols) == 1:
+141:            resolved[key] = cols[0]
+142:        else:
+143:            resolved[key] = cols[0]  # override with first
+144:
+145:    # Track missing
+146:    for key in REQUIRED_COLUMNS.keys():
+147:        if key not in resolved:
+148:            diagnostics["missing_after_detection"].append(REQUIRED_COLUMNS[key])
+149:
+150:    diagnostics["mapping"] = resolved
+151:    return resolved, diagnostics
+152:
+153:
+154:# ======================================================================
+155:# 4. CANONICAL FIELD INJECTION (Option A)
+156:# ======================================================================
+157:
+158:def inject_canonical_columns(df: pd.DataFrame, mapping: dict):
+159:    """
+160:    Adds canonical columns (REQUIRED_COLUMNS values) into df.
+161:    Does NOT drop original columns.
+162:    """
+163:
+164:    for key, canon in REQUIRED_COLUMNS.items():
+165:        if key in mapping:
+166:            df[canon] = df[mapping[key]]
+167:        else:
+168:            df[canon] = np.nan
+169:
+170:    return df
+171:
+172:
+173:# ======================================================================
+174:# 5. DATA TYPE NORMALIZATION
+175:# ======================================================================
+176:
+177:def normalize_types(df: pd.DataFrame):
+178:    df[REQUIRED_COLUMNS["date"]] = pd.to_datetime(
+179:        df[REQUIRED_COLUMNS["date"]], errors="coerce"
+180:    )
+181:    df[REQUIRED_COLUMNS["amount"]] = pd.to_numeric(
+182:        df[REQUIRED_COLUMNS["amount"]], errors="coerce"
+183:    )
+184:    df[REQUIRED_COLUMNS["status"]] = (
+185:        df[REQUIRED_COLUMNS["status"]]
+186:        .astype(str)
+187:        .str.upper()
+188:        .str.strip()
+189:    )
+190:    return df
+191:
+192:
+193:# ======================================================================
+194:# 6. DUPLICATE DETECTION + RESOLUTION
+195:# ======================================================================
+196:
+197:def detect_duplicates(df, subset_col=None):
+198:    if subset_col is None:
+199:        subset_col = REQUIRED_COLUMNS["reference"]
+200:    subset = [subset_col] if isinstance(subset_col, str) else list(subset_col)
+201:    return df[df.duplicated(subset=subset, keep=False)].copy()
+202:
+203:
+204:def resolve_duplicate_group(group):
+205:    status_col = REQUIRED_COLUMNS["status"]
+206:    date_col = REQUIRED_COLUMNS["date"]
+207:
+208:    success_rows = group[group[status_col] == "SUCCESS"]
+209:    if len(success_rows) == 1:
+210:        return success_rows.iloc[0]
+211:    if len(success_rows) > 1:
+212:        success_rows[date_col] = pd.to_datetime(success_rows[date_col], errors="coerce")
+213:        return success_rows.sort_values(date_col).iloc[-1]
+214:
+215:    group[date_col] = pd.to_datetime(group[date_col], errors="coerce")
+216:    return group.sort_values(date_col).iloc[-1]
+217:
+218:
+219:def resolve_duplicates(df, subset_col=None):
+220:    key = subset_col if subset_col is not None else REQUIRED_COLUMNS["reference"]
+221:
+222:    dupes = detect_duplicates(df, key)
+223:    if dupes.empty:
+224:        return df.copy(), dupes
+225:
+226:    cleaned = df.groupby(key, group_keys=False).apply(resolve_duplicate_group)
+227:    return cleaned.reset_index(drop=True), dupes
+228:
+229:
+230:# ======================================================================
+231:# 7. CLEANING PIPELINES
+232:# ======================================================================
+233:
+234:def clean_csgmap(df_raw: pd.DataFrame):
+235:    mapping, diagnostics = detect_all_columns(df_raw, "CSGMAP")
+236:    df = inject_canonical_columns(df_raw.copy(), mapping)
+237:
+238:    # Now verify required canonical fields exist
+239:    missing = [col for col in REQUIRED_COLUMNS.values() if col not in df.columns]
+240:    if missing:
+241:        raise ValueError(f"CSGMAP missing required columns: {missing}")
+242:
+243:    df = normalize_types(df)
+244:    cleaned, dupes = resolve_duplicates(df)
+245:
+246:    summary = {
+247:        "sheet": "CSGMAP",
+248:        "total_rows_after_cleaning": len(cleaned),
+249:        "total_duplicates_detected": len(dupes),
+250:        "rows_by_status": cleaned[REQUIRED_COLUMNS["status"]]
+251:        .value_counts(dropna=False)
+252:        .to_dict(),
+253:        "amount_by_status": cleaned.groupby(
+254:            REQUIRED_COLUMNS["status"], dropna=False
+255:        )[REQUIRED_COLUMNS["amount"]].sum(min_count=1).to_dict(),
+256:    }
+257:
+258:    return cleaned, dupes, summary, diagnostics
+259:
+260:
+261:def clean_partner_sheet(df_raw: pd.DataFrame, sheet_name: str):
+262:    mapping, diagnostics = detect_all_columns(df_raw, sheet_name)
+263:    df = inject_canonical_columns(df_raw.copy(), mapping)
+264:
+265:    # Special rule for PPT — assume STATUS = SUCCESS
+266:    if sheet_name == "PPT":
+267:        df[REQUIRED_COLUMNS["status"]] = "SUCCESS"
+268:
+269:    # Fallback Merchant Ref logic
+270:    if df[REQUIRED_COLUMNS["merchant"]].isna().all():
+271:        try:
+272:            df[REQUIRED_COLUMNS["merchant"]] = (
+273:                df_raw["Trans.ID"]
+274:                if "Trans.ID" in df_raw.columns
+275:                else df[REQUIRED_COLUMNS["reference"]]
+276:            )
+277:        except:
+278:            df[REQUIRED_COLUMNS["merchant"]] = df[REQUIRED_COLUMNS["reference"]]
+279:
+280:    df = normalize_types(df)
+281:
+282:    dedup_col = REQUIRED_COLUMNS["reference"]
+283:    if sheet_name == "TELECEL":
+284:        receipt_col = find_column_case_insensitive(df, "Receipt No.")
+285:        if receipt_col:
+286:            dedup_col = receipt_col
+287:
+288:    cleaned, dupes = resolve_duplicates(df, dedup_col)
+289:
+290:    summary = {
+291:        "sheet": sheet_name,
+292:        "total_rows_after_cleaning": len(cleaned),
+293:        "total_duplicates_detected": len(dupes),
+294:        "rows_by_status": cleaned[REQUIRED_COLUMNS["status"]]
+295:        .value_counts(dropna=False)
+296:        .to_dict(),
+297:        "amount_by_status": cleaned.groupby(
+298:            REQUIRED_COLUMNS["status"], dropna=False
+299:        )[REQUIRED_COLUMNS["amount"]].sum(min_count=1).to_dict(),
+300:    }
+301:
+302:    return cleaned, dupes, summary, diagnostics
+303:
+304:
+305:# ======================================================================
+306:# 8. MERGING — NEW SAFE PRE-SUFFIX METHOD
+307:# ======================================================================
+308:
+309:def reconcile_sheet(csgmap_df, partner_df, sheet_name):
+310:    ref = REQUIRED_COLUMNS["reference"]
+311:    amt = REQUIRED_COLUMNS["amount"]
+312:    date_col = REQUIRED_COLUMNS["date"]
+313:
+314:    # Pre-suffix (prevents pandas MergeError)
+315:    csg = csgmap_df.add_suffix("_csgmap")
+316:    prt = partner_df.add_suffix("_partner")
+317:
+318:    # Rename reference columns back so they match
+319:    csg = csg.rename(columns={f"{ref}_csgmap": ref})
+320:    prt = prt.rename(columns={f"{ref}_partner": ref})
+321:
+322:    # enforce consistent reference key formatting to avoid merge errors/mismatches
+323:    for frame in (csg, prt):
+324:        frame[ref] = standardize_reference_series(frame[ref])
+325:
+326:    merged = prt.merge(csg, on=ref, how="outer", indicator=True)
+327:
+328:    status_partner = REQUIRED_COLUMNS["status"] + "_partner"
+329:    status_csgmap = REQUIRED_COLUMNS["status"] + "_csgmap"
+330:    amt_partner = f"{amt}_partner"
+331:    amt_csgmap = f"{amt}_csgmap"
+332:
+333:    matched = merged[merged["_merge"] == "both"].copy()
+334:    matched["source"] = sheet_name
+335:
+336:    # Only consider matches as valid when transaction amounts align
+337:    partner_amount = pd.to_numeric(matched[amt_partner], errors="coerce")
+338:    csgmap_amount = pd.to_numeric(matched[amt_csgmap], errors="coerce")
+339:    amount_equal = (
+340:        partner_amount.notna()
+341:        & csgmap_amount.notna()
+342:        & np.isclose(partner_amount, csgmap_amount, rtol=0.0, atol=0.01)
+343:    )
+344:    matched_amount = matched[amount_equal].copy()
+345:    mismatched_amount = matched[~amount_equal].copy()
+346:
+347:    partner_unmatched = merged[merged["_merge"] == "left_only"].copy()
+348:    csgmap_unmatched = merged[merged["_merge"] == "right_only"].copy()
+349:
+350:    if not mismatched_amount.empty:
+351:        partner_unmatched = pd.concat(
+352:            [partner_unmatched, mismatched_amount], ignore_index=True
+353:        )
+354:        csgmap_unmatched = pd.concat(
+355:            [csgmap_unmatched, mismatched_amount], ignore_index=True
+356:        )
+357:
+358:    partner_unmatched["source"] = sheet_name
+359:    csgmap_unmatched["source"] = "CSGMAP"
+360:
+361:    # Determine conflicts vs reconciled based on status availability
+362:    partner_status_available = matched_amount[status_partner].notna()
+363:    csg_status_available = matched_amount[status_csgmap].notna()
+364:    both_status_available = partner_status_available & csg_status_available
+365:    both_success = (
+366:        matched_amount[status_partner] == "SUCCESS"
+367:    ) & (matched_amount[status_csgmap] == "SUCCESS")
+368:    status_conflict_mask = both_status_available & ~both_success
+369:
+370:    conflicts = matched_amount[status_conflict_mask].copy()
+371:    reconciled = matched_amount[~status_conflict_mask].copy()
+372:
+373:    for df in [conflicts, reconciled, partner_unmatched, csgmap_unmatched]:
+374:        if "_merge" in df.columns:
+375:            df.drop(columns=["_merge"], inplace=True)
+376:
+377:    def format_csg_rows(df, include_partner_status=True):
+378:        desired_cols = [
+379:            ref,
+380:            date_col,
+381:            amt,
+382:            status_csgmap,
+383:        ]
+384:        if include_partner_status:
+385:            desired_cols.append(status_partner)
+386:        desired_cols.append("source")
+387:
+388:        if df.empty:
+389:            return pd.DataFrame(columns=desired_cols)
+390:
+391:        rename_map = {}
+392:        subset_cols = []
+393:        if ref in df.columns:
+394:            subset_cols.append(ref)
+395:        for field in [date_col, amt]:
+396:            col_name = f"{field}_csgmap"
+397:            if col_name in df.columns:
+398:                subset_cols.append(col_name)
+399:                rename_map[col_name] = field
+400:        if status_csgmap in df.columns:
+401:            subset_cols.append(status_csgmap)
+402:        if include_partner_status and status_partner in df.columns:
+403:            subset_cols.append(status_partner)
+404:        if "source" in df.columns:
+405:            subset_cols.append("source")
+406:
+407:        formatted = df[subset_cols].copy()
+408:        formatted.rename(columns=rename_map, inplace=True)
+409:        for col in desired_cols:
+410:            if col not in formatted.columns:
+411:                formatted[col] = np.nan
+412:        return formatted[desired_cols]
+413:
+414:    def format_partner_rows(df):
+415:        desired_cols = [ref, date_col, amt, "source"]
+416:        if df.empty:
+417:            return pd.DataFrame(columns=desired_cols)
+418:
+419:        rename_map = {}
+420:        subset_cols = []
+421:        if ref in df.columns:
+422:            subset_cols.append(ref)
+423:        for field in [date_col, amt]:
+424:            col_name = f"{field}_partner"
+425:            if col_name in df.columns:
+426:                subset_cols.append(col_name)
+427:                rename_map[col_name] = field
+428:        if "source" in df.columns:
+429:            subset_cols.append("source")
+430:
+431:        formatted = df[subset_cols].copy()
+432:        formatted.rename(columns=rename_map, inplace=True)
+433:        for col in desired_cols:
+434:            if col not in formatted.columns:
+435:                formatted[col] = np.nan
+436:        return formatted[desired_cols]
+437:
+438:    # Build a CSGMAP-focused view for reconciled/conflict matches and tidy unmatched sets
+439:    reconciled_view = format_csg_rows(reconciled, include_partner_status=True)
+440:    conflicts_view = format_csg_rows(conflicts, include_partner_status=True)
+441:
+442:    partner_unmatched_view = format_partner_rows(partner_unmatched)
+443:
+444:    # strip the temporary _csgmap suffixes so the next reconciliation pass
+445:    # sees canonical column names again (retain all canonical fields for AHAN logic)
+446:    canonical_csg_cols = [
+447:        f"{col}_csgmap" for col in REQUIRED_COLUMNS.values()
+448:        if f"{col}_csgmap" in csgmap_unmatched.columns
+449:    ]
+450:    keep_cols = [col for col in ["source", ref] if col in csgmap_unmatched.columns]
+451:    trimmed_cols = keep_cols + canonical_csg_cols
+452:    csgmap_unmatched_clean = csgmap_unmatched[trimmed_cols].copy()
+453:    rename_map = {
+454:        f"{col}_csgmap": col for col in REQUIRED_COLUMNS.values()
+455:        if f"{col}_csgmap" in csgmap_unmatched_clean.columns
+456:    }
+457:    csgmap_unmatched_clean.rename(columns=rename_map, inplace=True)
+458:
+459:    return reconciled_view, conflicts_view, partner_unmatched_view, csgmap_unmatched_clean
+460:
+461:
+462:# ======================================================================
+463:# 9. AHAN MATCHING
+464:# ======================================================================
+465:
+466:def match_ahan_transactions(csgmap_unmatched_df, ahan_df):
+467:    amt = REQUIRED_COLUMNS["amount"]
+468:    mob = REQUIRED_COLUMNS["mobile"]
+469:    ref = REQUIRED_COLUMNS["reference"]
+470:
+471:    ahan_df["ahan_key"] = ahan_df[amt].astype(str) + "|" + ahan_df[mob].astype(str)
+472:    csgmap_unmatched_df["csg_key"] = csgmap_unmatched_df[amt].astype(str) + "|" + csgmap_unmatched_df[mob].astype(str)
+473:
+474:    merged = ahan_df.merge(
+475:        csgmap_unmatched_df,
+476:        left_on="ahan_key",
+477:        right_on="csg_key",
+478:        how="left",
+479:        suffixes=("_ahan", "_csg"),
+480:    )
+481:
+482:    matched_rows = []
+483:    ambiguous = []
+484:    unmatched = []
+485:
+486:    for key, group in merged.groupby("ahan_key"):
+487:        matches = group[group["csg_key"].notna()]
+488:
+489:        if len(matches) == 1:
+490:            row = matches.iloc[0].copy()
+491:            row["source"] = "AHAN"
+492:            matched_rows.append(row)
+493:
+494:        elif len(matches) > 1:
+495:            ambiguous.append(group.iloc[0])
+496:
+497:        else:
+498:            unmatched.append(group.iloc[0])
+499:
+500:    matched_df = pd.DataFrame(matched_rows)
+501:    amb_df = pd.DataFrame(ambiguous)
+502:    unmatch_df = pd.DataFrame(unmatched)
+503:
+504:    if not matched_df.empty:
+505:        matched_refs = matched_df[ref].unique()
+506:        new_unmatched = csgmap_unmatched_df[
+507:            ~csgmap_unmatched_df[ref].isin(matched_refs)
+508:        ]
+509:    else:
+510:        new_unmatched = csgmap_unmatched_df.copy()
+511:
+512:    return matched_df, amb_df, unmatch_df, new_unmatched
+513:
+514:
+515:# ======================================================================
+516:# 10. FINAL CONSOLIDATION
+517:# ======================================================================
+518:
+519:def consolidate_reconciliation_results(
+520:    reconciled_list,
+521:    conflicts_list,
+522:    partner_unmatched_list,
+523:    final_csgmap_unmatched,
+524:    ahan_matched,
+525:    ahan_amb,
+526:    ahan_unmatched,
+527:):
+528:    reconciled = (
+529:        pd.concat(reconciled_list + [ahan_matched], ignore_index=True)
+530:        .drop_duplicates()
+531:    )
+532:    conflicts = pd.concat(conflicts_list, ignore_index=True)
+533:    partner_unmatched = pd.concat(partner_unmatched_list, ignore_index=True)
+534:
+535:    return {
+536:        "reconciled": reconciled,
+537:        "status_conflicts": conflicts,
+538:        "partner_unmatched": partner_unmatched,
+539:        "ahan_ambiguous": ahan_amb,
+540:        "ahan_unmatched": ahan_unmatched,
+541:        "csgmap_unmatched": final_csgmap_unmatched,
+542:    }
