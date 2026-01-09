@@ -92,7 +92,7 @@ def render_dataframe_block(df, title, filename_prefix, key_prefix, show_title=Tr
         st.markdown(f"**{title} ({len(df)} rows)**")
     if df.empty:
         st.caption("No records available.")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
     download_buttons(df, filename_prefix, key_prefix)
 
 
@@ -373,7 +373,7 @@ with tabs[0]:
                 for f in partner_files
             ]
             st.markdown("#### File Summary")
-            st.dataframe(pd.DataFrame(file_summary), use_container_width=True)
+            st.dataframe(pd.DataFrame(file_summary), width="stretch")
 
     if st.session_state.get("csgmap_file") and st.session_state.get("partner_files"):
         st.success("Files uploaded. Continue to Clean and Validate.")
@@ -465,11 +465,14 @@ with tabs[1]:
             if delim is not None:
                 note_parts.append(f"Delimiter: {delim_label}")
             st.caption(f"{pname}: " + " | ".join(note_parts))
-        cleaned, dupes, summary, diag = clean_partner_sheet(
-            df,
-            pname,
-            st.session_state.get("csgmap_clean"),
-        )
+        try:
+            cleaned, dupes, summary, diag = clean_partner_sheet(
+                df,
+                pname,
+                st.session_state.get("csgmap_clean"),
+            )
+        except TypeError:
+            cleaned, dupes, summary, diag = clean_partner_sheet(df, pname)
         cleaned_partners[pname] = cleaned
         partner_dupes_map[pname] = dupes
         partner_summaries.append(
@@ -486,7 +489,7 @@ with tabs[1]:
 
     if partner_summaries:
         st.markdown("#### Partner Validation Summary")
-        st.dataframe(pd.DataFrame(partner_summaries), use_container_width=True)
+        st.dataframe(pd.DataFrame(partner_summaries), width="stretch")
 
         st.markdown("#### Duplicate Records by Partner")
         for row in partner_summaries:
@@ -603,7 +606,7 @@ with tabs[3]:
                 }
             )
         if category_rows:
-            st.dataframe(pd.DataFrame(category_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(category_rows), width="stretch")
         else:
             st.caption("No result categories available.")
 
@@ -636,7 +639,7 @@ with tabs[3]:
                 )
 
             st.markdown("#### Partner Summary")
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(summary_rows), width="stretch")
 
             partner_tabs = st.tabs([entry["label"] for entry in partner_entries])
             for tab, entry in zip(partner_tabs, partner_entries):
