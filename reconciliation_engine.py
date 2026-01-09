@@ -613,6 +613,10 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
         for col in desired_cols:
             if col not in formatted.columns:
                 formatted[col] = np.nan
+        data_cols = [col for col in desired_cols if col != "source"]
+        if data_cols:
+            cleaned = formatted[data_cols].replace(r"^\s*$", np.nan, regex=True)
+            formatted = formatted.loc[~cleaned.isna().all(axis=1)].copy()
         return formatted[desired_cols]
 
     # Build a CSGMAP-focused view for reconciled/conflict matches and tidy unmatched sets

@@ -108,6 +108,87 @@ def render_dataframe_section(df, title, filename_prefix, key_prefix, expanded=Fa
         )
 
 
+def build_merchant_summary(df, amount_col, merchant_col):
+    df = normalize_dataframe(df)
+    summary_columns = ["Merchant", "Total Amount"]
+    if df.empty:
+        return pd.DataFrame(columns=summary_columns)
+
+    if merchant_col in df.columns:
+        merchant_series = df[merchant_col].fillna("Unknown").astype(str)
+    else:
+        merchant_series = pd.Series(["Merchant not available"] * len(df))
+
+    if amount_col in df.columns:
+        amount_series = pd.to_numeric(df[amount_col], errors="coerce")
+    else:
+        amount_series = pd.Series([pd.NA] * len(df))
+
+    summary = (
+        pd.DataFrame({"Merchant": merchant_series, "Total Amount": amount_series})
+        .groupby("Merchant", dropna=False, sort=True)["Total Amount"]
+        .sum(min_count=1)
+        .reset_index()
+    )
+    total_value = summary["Total Amount"].sum(min_count=1)
+    total_row = pd.DataFrame([{"Merchant": "Total", "Total Amount": total_value}])
+    return pd.concat([summary, total_row], ignore_index=True)
+
+
+def build_grouped_tables_by_source(df, amount_col, merchant_col):
+    df = normalize_dataframe(df)
+    if df.empty:
+        return {}
+    if "source" not in df.columns:
+        df = df.copy()
+        df["source"] = "Unknown"
+
+    grouped_tables = {}
+    for source_value, group in df.groupby("source", dropna=False):
+        source_label = "Unknown" if pd.isna(source_value) else str(source_value)
+        grouped_tables[source_label] = build_merchant_summary(
+            group,
+            amount_col,
+            merchant_col,
+        )
+    return grouped_tables
+
+
+def build_summary_workbook(reconciled_df, grouped_sets):
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer) as writer:
+        normalize_dataframe(reconciled_df).to_excel(
+            writer,
+            sheet_name="Reconciliation Dump",
+            index=False,
+        )
+
+        sheet_name = "Grouped by Merchant"
+        startrow = 0
+        for dataset_label, source_tables in grouped_sets.items():
+            if not source_tables:
+                continue
+            for source_label, table in source_tables.items():
+                header_df = pd.DataFrame([[f"{dataset_label} - {source_label}"]])
+                header_df.to_excel(
+                    writer,
+                    sheet_name=sheet_name,
+                    startrow=startrow,
+                    index=False,
+                    header=False,
+                )
+                startrow += 1
+                table.to_excel(
+                    writer,
+                    sheet_name=sheet_name,
+                    startrow=startrow,
+                    index=False,
+                )
+                startrow += len(table) + 2
+    excel_buffer.seek(0)
+    return excel_buffer.getvalue()
+
+
 # ============================================================
 # SESSION STATE INITIALIZATION
 # ============================================================
@@ -776,6 +857,43 @@ with tabs[3]:
 
     with results_tabs[3]:
         st.subheader("All Outputs")
+        st.markdown("#### Reconciled Summary by Merchant")
+
+        summary_inputs = {
+            "Reconciled": results.get("reconciled", pd.DataFrame()),
+            "Status Conflicts": results.get("status_conflicts", pd.DataFrame()),
+            "Partner Unmatched": results.get("partner_unmatched", pd.DataFrame()),
+        }
+        grouped_sets = {
+            label: build_grouped_tables_by_source(
+                df,
+                AMOUNT_COLUMN,
+                "Merchant",
+            )
+            for label, df in summary_inputs.items()
+        }
+
+        for dataset_label, source_tables in grouped_sets.items():
+            st.markdown(f"#### {dataset_label}")
+            if not source_tables:
+                st.caption("No records available.")
+                continue
+            for source_label, table in source_tables.items():
+                st.markdown(f"**{source_label}**")
+                st.dataframe(table, width="stretch")
+
+        summary_workbook = build_summary_workbook(
+            results.get("reconciled", pd.DataFrame()),
+            grouped_sets,
+        )
+        st.download_button(
+            label="Download reconciliation summary workbook",
+            data=summary_workbook,
+            file_name="reconciliation_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="reconciliation-summary-workbook",
+        )
+
         other_keys = [
             key
             for key in results.keys()
