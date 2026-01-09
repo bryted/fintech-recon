@@ -21,7 +21,7 @@ from reconciliation_engine import (
 # ============================================================
 
 st.set_page_config(
-    page_title="MojoPay Reconciliation Engine",
+    page_title="MojoPay Reconciliation Platform",
     page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -216,6 +216,132 @@ def compute_step_status():
         return "Partial upload"
     return "Not started"
 
+
+def reset_reconciliation_state():
+    st.session_state["results"] = {}
+    for key in [
+        "csgmap_clean",
+        "cleaned_partners",
+        "partner_cleaning_summaries",
+        "partner_diag_map",
+        "csgmap_cleaning_summary",
+        "csgmap_dupe_rows",
+        "csgmap_diag",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def get_step_progress():
+    has_csgmap = bool(st.session_state.get("csgmap_file"))
+    has_partners = bool(st.session_state.get("partner_files"))
+    has_cleaned = bool(st.session_state.get("cleaned_partners"))
+    has_results = bool(st.session_state.get("results"))
+
+    steps = [
+        ("Upload Files", has_csgmap and has_partners),
+        ("Cleaning", has_cleaned),
+        ("Reconciliation", has_results),
+        ("Results", has_results),
+    ]
+
+    current_step = None
+    for label, completed in steps:
+        if not completed and current_step is None:
+            current_step = label
+    if current_step is None:
+        current_step = "Results"
+
+    step_states = []
+    for label, completed in steps:
+        if completed:
+            status = "completed"
+        elif label == current_step:
+            status = "current"
+        else:
+            status = "pending"
+        step_states.append((label, status))
+
+    return step_states, current_step
+
+
+def collect_quality_alerts():
+    alerts = []
+
+    partner_files = st.session_state.get("partner_files", [])
+    unknown_files = [
+        f.name for f in partner_files if detect_partner_name(f.name) == "UNKNOWN"
+    ]
+    if unknown_files:
+        alerts.append(
+            f"Unrecognized partner file names: {len(unknown_files)} file(s)."
+        )
+
+    header_notes = st.session_state.get("header_row_notes", {})
+    header_offsets = [
+        name
+        for name, note in header_notes.items()
+        if note.get("header_row", 0) > 0
+    ]
+    if header_offsets:
+        alerts.append(
+            f"Header row detected below first row in {len(header_offsets)} file(s)."
+        )
+
+    csgmap_diag = st.session_state.get("csgmap_diag", {})
+    if csgmap_diag and csgmap_diag.get("missing_after_detection"):
+        missing_count = len(csgmap_diag["missing_after_detection"])
+        alerts.append(f"CSGMAP missing {missing_count} required column(s).")
+
+    partner_diag_map = st.session_state.get("partner_diag_map", {})
+    partner_missing = sum(
+        1
+        for diag in partner_diag_map.values()
+        if diag and diag.get("missing_after_detection")
+    )
+    if partner_missing:
+        alerts.append(
+            f"{partner_missing} partner file(s) missing required column(s)."
+        )
+
+    csgmap_summary = st.session_state.get("csgmap_cleaning_summary", {})
+    if csgmap_summary:
+        cleaned_rows = csgmap_summary.get("total_rows_after_cleaning", 0)
+        if cleaned_rows == 0:
+            alerts.append("CSGMAP cleaned rows is 0.")
+        dupe_rows = st.session_state.get("csgmap_dupe_rows", 0)
+        dupe_refs = csgmap_summary.get("total_duplicates_detected", 0)
+        if dupe_rows and dupe_refs == 0:
+            alerts.append(
+                "CSGMAP duplicate rows present but duplicate references are 0."
+            )
+
+    partner_summaries = st.session_state.get("partner_cleaning_summaries", [])
+    if partner_summaries:
+        zero_cleaned = [
+            row["Partner"]
+            for row in partner_summaries
+            if row.get("Cleaned rows", 0) == 0
+        ]
+        if zero_cleaned:
+            alerts.append(
+                f"Partners with 0 cleaned rows: {', '.join(zero_cleaned)}."
+            )
+
+        dup_mismatch = [
+            row["Partner"]
+            for row in partner_summaries
+            if row.get("Duplicate rows", 0) > 0
+            and row.get("Duplicate references", 0) == 0
+        ]
+        if dup_mismatch:
+            alerts.append(
+                "Duplicate rows detected but duplicate references are 0 for: "
+                + ", ".join(dup_mismatch)
+                + "."
+            )
+
+    return alerts
+
 # ============================================================
 # SIDEBAR - RUN STATUS
 # ============================================================
@@ -354,13 +480,24 @@ def detect_partner_name(filename):
     return "UNKNOWN"
 
 
-def sidebar_status():
-    with st.sidebar:
+def sidebar_status(placeholder):
+    placeholder.empty()
+    with placeholder.container():
         st.image("https://mojo-pay.com/images/mojoLogo.svg", width=150)
 
         st.markdown("### Run Status")
         st.session_state["step_status"] = compute_step_status()
         st.write(f"Stage: {st.session_state.get('step_status', 'Not started')}")
+
+        st.markdown("### Progress")
+        step_states, current_step = get_step_progress()
+        icons = {
+            "completed": "[x]",
+            "current": "[>]",
+            "pending": "[ ]",
+        }
+        for label, status in step_states:
+            st.write(f"{icons[status]} {label}")
 
         st.markdown("### Files")
         csgmap_file = st.session_state.get("csgmap_file")
@@ -392,10 +529,13 @@ def sidebar_status():
             col1.metric("Reconciled", reconciled_count)
             col2.metric("Conflicts", conflict_count)
 
+        alerts = collect_quality_alerts()
+        if alerts:
+            st.markdown("### Quality Alerts")
+            for alert in alerts:
+                st.write(f"- {alert}")
+
         st.caption("MojoPay - Automated Financial Data Integrity Engine")
-
-
-sidebar_status()
 
 # ============================================================
 # MAIN HEADER
@@ -406,6 +546,9 @@ st.caption(
     "Upload files, clean data, and reconcile CSGMAP with partner statements. "
     "All outputs remain available for audit review."
 )
+
+SIDEBAR_PLACEHOLDER = st.sidebar.empty()
+sidebar_status(SIDEBAR_PLACEHOLDER)
 
 # ============================================================
 # UNIVERSAL FILE LOADER
@@ -433,8 +576,12 @@ with tabs[0]:
         csgmap_file = st.file_uploader(
             "Main CSGMAP file (CSV, XLSX, XLS)",
             type=["csv", "xlsx", "xls"],
+            key="csgmap-upload",
         )
         if csgmap_file:
+            if st.session_state.get("csgmap_file_name") != csgmap_file.name:
+                reset_reconciliation_state()
+            st.session_state["csgmap_file_name"] = csgmap_file.name
             st.write(f"Uploaded: {csgmap_file.name}")
             st.session_state["csgmap_file"] = csgmap_file
 
@@ -444,8 +591,13 @@ with tabs[0]:
             "Partner files (CSV, XLSX, XLS)",
             type=["csv", "xlsx", "xls"],
             accept_multiple_files=True,
+            key="partner-uploads",
         )
         if partner_files:
+            partner_names = sorted([f.name for f in partner_files])
+            if st.session_state.get("partner_file_names") != partner_names:
+                reset_reconciliation_state()
+            st.session_state["partner_file_names"] = partner_names
             st.write(f"Uploaded partner files: {len(partner_files)}")
             st.session_state["partner_files"] = partner_files
 
@@ -458,6 +610,7 @@ with tabs[0]:
 
     if st.session_state.get("csgmap_file") and st.session_state.get("partner_files"):
         st.success("Files uploaded. Continue to Clean and Validate.")
+    sidebar_status(SIDEBAR_PLACEHOLDER)
 
 # ============================================================
 # TAB 2 - CLEANING
@@ -497,6 +650,9 @@ with tabs[1]:
         st.caption(" | ".join(note_parts))
 
     csgmap_clean, csgmap_dupes, csgmap_summary, csgmap_diag = clean_csgmap(csgmap_df)
+    st.session_state["csgmap_cleaning_summary"] = csgmap_summary
+    st.session_state["csgmap_dupe_rows"] = len(csgmap_dupes)
+    st.session_state["csgmap_diag"] = csgmap_diag
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total rows", len(csgmap_df))
@@ -522,6 +678,7 @@ with tabs[1]:
     cleaned_partners = {}
     partner_summaries = []
     partner_dupes_map = {}
+    partner_diag_map = {}
 
     for f in st.session_state["partner_files"]:
         pname = detect_partner_name(f.name)
@@ -556,6 +713,7 @@ with tabs[1]:
             cleaned, dupes, summary, diag = clean_partner_sheet(df, pname)
         cleaned_partners[pname] = cleaned
         partner_dupes_map[pname] = dupes
+        partner_diag_map[pname] = diag
         partner_summaries.append(
             {
                 "Partner": pname,
@@ -567,6 +725,8 @@ with tabs[1]:
         )
 
     st.session_state["cleaned_partners"] = cleaned_partners
+    st.session_state["partner_cleaning_summaries"] = partner_summaries
+    st.session_state["partner_diag_map"] = partner_diag_map
 
     if partner_summaries:
         st.markdown("#### Partner Validation Summary")
@@ -583,6 +743,7 @@ with tabs[1]:
             )
 
     st.success("Cleaning complete. Continue to Reconciliation.")
+    sidebar_status(SIDEBAR_PLACEHOLDER)
 
 # ============================================================
 # TAB 3 - RECONCILIATION
@@ -643,6 +804,7 @@ with tabs[2]:
 
     st.session_state["results"] = results
     st.success("Reconciliation complete. Proceed to the Results tab.")
+    sidebar_status(SIDEBAR_PLACEHOLDER)
 
 # ============================================================
 # TAB 4 - RESULTS
