@@ -44,6 +44,22 @@ def find_column_case_insensitive(df: pd.DataFrame, target: str):
     return None
 
 
+def find_column_exact_or_suffix(df: pd.DataFrame, target: str):
+    target_norm = target.strip().lower()
+    exact_match = None
+    suffixed_match = None
+    for col in df.columns:
+        col_norm = col.strip().lower()
+        if col_norm == target_norm:
+            exact_match = col
+            break
+        if col_norm.startswith(f"{target_norm}."):
+            suffix = col_norm[len(target_norm) + 1:]
+            if suffix.isdigit():
+                suffixed_match = col
+    return exact_match or suffixed_match
+
+
 def standardize_reference_series(series: pd.Series) -> pd.Series:
     def normalize(val):
         if pd.isna(val):
@@ -271,6 +287,11 @@ def clean_csgmap(df_raw: pd.DataFrame):
     mapping, diagnostics = detect_all_columns(df_raw, "CSGMAP")
     df = inject_canonical_columns(df_raw.copy(), mapping)
 
+    # Use Posted To Provider Amount as the canonical amount for CSGMAP when available
+    posted_amount_col = find_column_case_insensitive(df_raw, "Posted To Provider Amount")
+    if posted_amount_col:
+        df[REQUIRED_COLUMNS["amount"]] = df_raw[posted_amount_col]
+
     # Now verify required canonical fields exist
     missing = [col for col in REQUIRED_COLUMNS.values() if col not in df.columns]
     if missing:
@@ -295,9 +316,64 @@ def clean_csgmap(df_raw: pd.DataFrame):
     return cleaned, dupes, summary, diagnostics
 
 
-def clean_partner_sheet(df_raw: pd.DataFrame, sheet_name: str):
+def _build_gateway_reference_lookup(csgmap_df: pd.DataFrame):
+    if csgmap_df is None or not isinstance(csgmap_df, pd.DataFrame) or csgmap_df.empty:
+        return {}
+
+    ref_col = REQUIRED_COLUMNS["reference"]
+    date_col = REQUIRED_COLUMNS["date"]
+    if ref_col not in csgmap_df.columns or date_col not in csgmap_df.columns:
+        return {}
+
+    gateway_candidates = [
+        "Payment Gateway Ref. Code",
+        "Payment Gateway Ref Code",
+        "Payment Gateway Ref",
+        "Gateway Ref Code",
+    ]
+    gateway_col = None
+    for candidate in gateway_candidates:
+        gateway_col = find_column_case_insensitive(csgmap_df, candidate)
+        if gateway_col:
+            break
+
+    if gateway_col is None:
+        return {}
+
+    lookup_df = csgmap_df[[gateway_col, ref_col, date_col]].copy()
+    lookup_df["_gateway_norm"] = standardize_reference_series(lookup_df[gateway_col])
+    lookup_df = lookup_df[lookup_df["_gateway_norm"].notna()]
+    lookup_df = lookup_df.sort_values(date_col, na_position="first")
+    lookup_df = lookup_df.drop_duplicates(subset=["_gateway_norm"], keep="last")
+    return dict(zip(lookup_df["_gateway_norm"], lookup_df[ref_col]))
+
+
+def clean_partner_sheet(df_raw: pd.DataFrame, sheet_name: str, csgmap_df: pd.DataFrame = None):
     mapping, diagnostics = detect_all_columns(df_raw, sheet_name)
     df = inject_canonical_columns(df_raw.copy(), mapping)
+
+    # Partner-specific reference overrides for reconciliation keying
+    ref_col = REQUIRED_COLUMNS["reference"]
+    if sheet_name in {"MTN", "DD"}:
+        external_id_col = find_column_case_insensitive(df_raw, "External id")
+        if external_id_col:
+            df[ref_col] = df_raw[external_id_col]
+        date_raw_col = find_column_exact_or_suffix(df_raw, "Date")
+        if date_raw_col:
+            df[REQUIRED_COLUMNS["date"]] = df_raw[date_raw_col]
+        amount_raw_col = find_column_exact_or_suffix(df_raw, "Amount")
+        if amount_raw_col:
+            df[REQUIRED_COLUMNS["amount"]] = df_raw[amount_raw_col]
+    if sheet_name == "PPT":
+        merchant_ref_col = find_column_case_insensitive(df_raw, "Merchant Ref.Code")
+        if merchant_ref_col is None:
+            merchant_ref_col = find_column_case_insensitive(df_raw, "Merchant Ref Code")
+        if merchant_ref_col:
+            df[ref_col] = df_raw[merchant_ref_col]
+    if sheet_name in {"WESTOM", "EP"}:
+        merchant_ref_col = find_column_case_insensitive(df_raw, "MERCHANT_REFERENCE_CODE")
+        if merchant_ref_col:
+            df[ref_col] = df_raw[merchant_ref_col]
 
     if df[REQUIRED_COLUMNS["status"]].isna().all():
         df[REQUIRED_COLUMNS["status"]] = "SUCCESS"
@@ -320,6 +396,38 @@ def clean_partner_sheet(df_raw: pd.DataFrame, sheet_name: str):
         except:
             df[REQUIRED_COLUMNS["merchant"]] = df[REQUIRED_COLUMNS["reference"]]
 
+    # TELECEL: derive MojoPay reference from Details (text after ":") when missing
+    ref_col = REQUIRED_COLUMNS["reference"]
+    if sheet_name == "TELECEL":
+        details_col = find_column_case_insensitive(df_raw, "Details")
+        if details_col:
+            details_series = df_raw[details_col].astype(str)
+            split = details_series.str.split(":", n=1, expand=True)
+            if split.shape[1] > 1:
+                ref_from_details = split[1].str.strip()
+                ref_from_details = ref_from_details.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+                ref_norm = standardize_reference_series(df[ref_col])
+                fill_mask = ref_norm.isna() & ref_from_details.notna()
+                df.loc[fill_mask, ref_col] = ref_from_details[fill_mask]
+        completion_time_col = find_column_case_insensitive(df_raw, "Completion Time")
+        if completion_time_col:
+            df[REQUIRED_COLUMNS["date"]] = df_raw[completion_time_col]
+        paid_in_col = find_column_case_insensitive(df_raw, "Paid In")
+        if paid_in_col:
+            df[REQUIRED_COLUMNS["amount"]] = df_raw[paid_in_col]
+
+    # Fill missing MojoPay reference using Payment Gateway Ref. Code when possible
+    if csgmap_df is not None and ref_col in df.columns:
+        interpay_col = find_column_case_insensitive(df_raw, "Interpay Ref No")
+        if interpay_col:
+            gateway_lookup = _build_gateway_reference_lookup(csgmap_df)
+            if gateway_lookup:
+                ref_norm = standardize_reference_series(df[ref_col])
+                interpay_norm = standardize_reference_series(df_raw[interpay_col])
+                mapped_ref = interpay_norm.map(gateway_lookup)
+                fill_mask = ref_norm.isna() & mapped_ref.notna()
+                df.loc[fill_mask, ref_col] = mapped_ref[fill_mask]
+
     df = normalize_types(df)
 
     dedup_col = REQUIRED_COLUMNS["reference"]
@@ -327,6 +435,18 @@ def clean_partner_sheet(df_raw: pd.DataFrame, sheet_name: str):
         receipt_col = find_column_case_insensitive(df, "Receipt No.")
         if receipt_col:
             dedup_col = receipt_col
+    if sheet_name in {"MTN", "DD"}:
+        external_id_col = find_column_case_insensitive(df, "External id")
+        if external_id_col:
+            dedup_col = external_id_col
+    if sheet_name == "WESTOM":
+        merchant_ref_col = None
+        for candidate in ["MERCHANT_REFERENCE_CODE", "Merchant Reference Code"]:
+            merchant_ref_col = find_column_case_insensitive(df, candidate)
+            if merchant_ref_col:
+                break
+        if merchant_ref_col:
+            dedup_col = merchant_ref_col
 
     cleaned, dupes = resolve_duplicates(df, dedup_col)
     ref_col = dedup_col if isinstance(dedup_col, str) else REQUIRED_COLUMNS["reference"]
@@ -365,7 +485,7 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
 
     # enforce consistent reference key formatting to avoid merge errors/mismatches
     for frame in (csg, prt):
-        frame[ref] = standardize_reference_series(frame[ref])
+        frame[ref] = standardize_reference_series(frame[ref]).astype("object")
 
     merged = prt.merge(csg, on=ref, how="outer", indicator=True)
 
@@ -420,6 +540,9 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
             df.drop(columns=["_merge"], inplace=True)
 
     def format_csg_rows(df, include_partner_status=True):
+        merchant_col = None
+        if "Merchant_csgmap" in df.columns:
+            merchant_col = "Merchant_csgmap"
         desired_cols = [
             ref,
             date_col,
@@ -428,6 +551,8 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
         ]
         if include_partner_status:
             desired_cols.append(status_partner)
+        if merchant_col:
+            desired_cols.append("Merchant")
         desired_cols.append("source")
 
         if df.empty:
@@ -446,6 +571,9 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
             subset_cols.append(status_csgmap)
         if include_partner_status and status_partner in df.columns:
             subset_cols.append(status_partner)
+        if merchant_col:
+            subset_cols.append(merchant_col)
+            rename_map[merchant_col] = "Merchant"
         if "source" in df.columns:
             subset_cols.append("source")
 
@@ -499,6 +627,8 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
         f"{col}_csgmap" for col in REQUIRED_COLUMNS.values()
         if f"{col}_csgmap" in csgmap_unmatched.columns
     ]
+    if "Merchant_csgmap" in csgmap_unmatched.columns:
+        canonical_csg_cols.append("Merchant_csgmap")
     keep_cols = [col for col in ["source", ref] if col in csgmap_unmatched.columns]
     trimmed_cols = keep_cols + canonical_csg_cols
     csgmap_unmatched_clean = csgmap_unmatched[trimmed_cols].copy()
@@ -506,6 +636,8 @@ def reconcile_sheet(csgmap_df, partner_df, sheet_name):
         f"{col}_csgmap": col for col in REQUIRED_COLUMNS.values()
         if f"{col}_csgmap" in csgmap_unmatched_clean.columns
     }
+    if "Merchant_csgmap" in csgmap_unmatched_clean.columns:
+        rename_map["Merchant_csgmap"] = "Merchant"
     csgmap_unmatched_clean.rename(columns=rename_map, inplace=True)
 
     # Partner-level metrics & dataframes
